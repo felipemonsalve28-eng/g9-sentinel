@@ -24,10 +24,33 @@ def round_to_tick(val):
 async def get_market_signals(client):
     try:
         candles = await client.futures.get_candles(limit=50)
-        df = pd.DataFrame([{'close': float(c.close)} for c in candles])
+        df = pd.DataFrame([{
+            'high': float(c.high), 'low': float(c.low), 'close': float(c.close)
+        } for c in candles])
+        
         df['rsi'] = ta.rsi(df['close'], length=14)
-        return {"rsi": round(df['rsi'].iloc[-1], 2)}
-    except: return {"rsi": 50}
+        bb = ta.bbands(df['close'], length=20, std=2)
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['adx'] = adx_df['ADX_14'] if adx_df is not None else 0
+
+        current_rsi = round(df['rsi'].iloc[-1], 2)
+        current_adx = round(df['adx'].iloc[-1], 2)
+        upper_band = bb['BBU_20_2.0'].iloc[-1]
+        lower_band = bb['BBL_20_2.0'].iloc[-1]
+        
+        regimen = "TENDENCIA FUERTE" if current_adx > 25 else "RANGO/LATERAL"
+        trend = "SOBRECOMPRA" if current_rsi > 70 else ("SOBREVENTA" if current_rsi < 30 else "NEUTRAL")
+
+        return {
+            "rsi": current_rsi,
+            "trend": trend,
+            "adx": current_adx,
+            "regimen": regimen,
+            "bb_upper": round(upper_band, 2),
+            "bb_lower": round(lower_band, 2)
+        }
+    except Exception as e:
+        return {"rsi": 50, "trend": "NEUTRAL", "adx": 0, "regimen": "DESCONOCIDO", "bb_upper": 0, "bb_lower": 0}
 
 async def run_trading_cycle():
     print("⚡ G9-SENTINEL V14.6: MOTOR DE PORTAFOLIO ACTIVO")
@@ -72,7 +95,7 @@ async def run_trading_cycle():
                     p_prompt = f"""
                     GESTIÓN DE POSICIÓN {pos.id}
                     Dirección: {pos.side} | Entrada: ${pos.price} | Actual: ${current_price} | PnL: {pos.pl} SATS
-                    RSI: {signals['rsi']}
+                    RSI: {signals['rsi']} ({signals['trend']}) | ADX: {signals['adx']} ({signals['regimen']}) | BB: U {signals['bb_upper']} / L {signals['bb_lower']}
                     {memoria}
                     Decide: UPDATE_SL (para asegurar profit), CLOSE_POSITION (si el riesgo es alto) o HOLD_POSITION.
                     Responde SOLO JSON: {{"action": "...", "new_stop_loss": 0, "logic": "...", "confidence": 0}}
@@ -103,7 +126,7 @@ async def run_trading_cycle():
                 resumen_pos = [f"{t.side} @ ${t.price}" for t in trades]
                 prompt_entry = f"""
                 REBALANCEO DE CARTERA
-                Balance: {balance} SATS | Actuales: {resumen_pos} | RSI: {signals['rsi']}
+                Balance: {balance} SATS | Actuales: {resumen_pos} | RSI: {signals['rsi']} ({signals['trend']}) | ADX: {signals['adx']} ({signals['regimen']}) | BB: U {signals['bb_upper']} / L {signals['bb_lower']}
                 {memoria}
                 ¿Abrir nueva posición? Considera diversificar o cubrir (hedge).
                 Responde JSON: {{"action": "BUY/SELL/HOLD", "margin": int, "leverage": int, "stop_loss": float, "take_profit": float, "logic": "..."}}
