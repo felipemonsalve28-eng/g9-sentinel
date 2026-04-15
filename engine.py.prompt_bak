@@ -1,0 +1,163 @@
+import os
+import json
+import asyncio
+import warnings
+from dotenv import load_dotenv
+from google import genai
+from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
+from lnmarkets_sdk.v3.models.futures_isolated import FuturesOrder
+import pandas as pd
+import pandas_ta as ta
+from brain import G9Brain
+
+warnings.filterwarnings('ignore')
+load_dotenv('/home/felipemonsalve28/g9_production/.env')
+client_gemini = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+
+def round_to_tick(val):
+    """Fuerza los precios al múltiplo de 0.5 más cercano para LN Markets"""
+    return round(float(val) * 2) / 2 if val else None
+
+
+async def get_market_signals(client):
+    try:
+        candles = await client.futures.get_candles(limit=50)
+        df = pd.DataFrame([{
+            'open': float(c.open), 'high': float(c.high),
+            'low': float(c.low), 'close': float(c.close), 'volume': float(c.volume)
+        } for c in candles])
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        current_rsi = round(df['rsi'].iloc[-1], 2)
+        upper_band = bb['BBU_20_2.0'].iloc[-1]
+        lower_band = bb['BBL_20_2.0'].iloc[-1]
+        last_close = df['close'].iloc[-1]
+        vol = "ALTA" if (upper_band - lower_band) > (last_close * 0.01) else "NORMAL"
+        return {
+            "rsi": current_rsi, "bb_upper": round(upper_band, 2),
+            "bb_lower": round(lower_band, 2), "volatility": vol,
+            "trend": "SOBRECOMPRA" if current_rsi > 70 else ("SOBREVENTA" if current_rsi < 30 else "NEUTRAL")
+        }
+    except Exception as e:
+        return {"rsi": 50, "bb_upper": 0, "bb_lower": 0, "volatility": "NORMAL", "trend": "NEUTRAL"}
+
+async def run_trading_cycle():
+    print("🚀 Iniciando G9-Sentinel: Modo Bóveda Aislada + Filtro de Cordura...")
+    brain = G9Brain()
+    
+    config = APIClientConfig(
+        authentication=APIAuthContext(
+            key=os.getenv('LNM_KEY'),
+            secret=os.getenv('LNM_SECRET'),
+            passphrase=os.getenv('LNM_PASSPHRASE'),
+        ),
+        network="mainnet",
+        timeout=60.0
+    )
+
+    try:
+        async with LNMClient(config) as client:
+            account = await client.account.get_account()
+            balance = account.balance  
+            ticker = await client.futures.get_ticker()
+            current_price = float(ticker.last_price)
+            signals = await get_market_signals(client)
+            memoria = brain.get_context_for_gemini(limit=10)
+
+            prompt = f"""
+            Eres el motor de riesgo de G9-Sentinel. Tu directriz principal es AUMENTAR el balance.
+            Operamos EXCLUSIVAMENTE con Margen Aislado.
+            
+            SNAPSHOT DE MERCADO:
+            - Precio BTC: ${current_price}
+            - RSI: {signals['rsi']} ({signals['trend']})
+            - Volatilidad: {signals['volatility']}
+            - Bollinger: U {signals['bb_upper']} | L {signals['bb_lower']}
+            
+            SNAPSHOT DE CUENTA:
+            - Balance Disponible: {balance} SATS
+            - Precio BTC actual: ${current_price}
+            
+            REGLA DE ORO: La posición (margin) NUNCA debe superar el 35% del disponible ({int(balance * 0.35)} SATS).
+            
+            {memoria}
+            
+            INSTRUCCIONES ESTRICTAS:
+            1. 'margin': SATS a arriesgar (Max 35% del balance).
+            2. 'leverage': Apalancamiento (1-50x).
+            3. 'stop_loss' y 'take_profit': Precios exactos. Recuerda: Si es BUY, TP debe ser MAYOR al precio actual y SL MENOR. Si es SELL, TP debe ser MENOR al precio actual y SL MAYOR.
+            
+            Responde SOLO con JSON, sin markdown:
+            {{
+                "action": "BUY" o "SELL" o "HOLD",
+                "margin": numero entero,
+                "leverage": numero entero,
+                "stop_loss": numero decimal,
+                "take_profit": numero decimal,
+                "confidence": numero del 1 al 100,
+                "logic": "Explicación breve"
+            }}
+            """
+            
+            print(f"📊 Balance: {balance} SATS | Precio: ${current_price}")
+            print("🧠 Gemini calculando Riesgo...")
+            
+            response = client_gemini.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            clean_json = response.text.replace('```json', '').replace('```', '').strip()
+            decision = json.loads(clean_json)
+            
+            action = decision.get("action")
+            margin = decision.get("margin", 0)
+            leverage = decision.get("leverage", 1)
+            
+            # 1. Redondeo inicial
+            sl = round_to_tick(decision.get("stop_loss"))
+            tp = round_to_tick(decision.get("take_profit"))
+            
+            # 2. FILTRO DE CORDURA MATEMÁTICA (Anti-Alucinaciones)
+            if action == "BUY":
+                if tp <= current_price: 
+                    tp = round_to_tick(current_price + 15) # Forzar TP por encima
+                if sl >= current_price: 
+                    sl = round_to_tick(current_price - 15) # Forzar SL por debajo
+            elif action == "SELL":
+                if tp >= current_price: 
+                    tp = round_to_tick(current_price - 15)
+                if sl <= current_price: 
+                    sl = round_to_tick(current_price + 15)
+            
+            print(f"\n⚡ DECISIÓN: {action} (Confianza: {decision.get('confidence')}%)")
+            print(f"📝 Lógica: {decision.get('logic')}")
+
+            if action != "HOLD":
+                if margin > (balance * 0.35):
+                    margin = int(balance * 0.35)
+
+                print(f"🔨 Ejecutando {action} | Margen: {margin} SATS | Apalan: {leverage}x")
+                print(f"🛡️ SL Validado: {sl} | TP Validado: {tp}")
+                
+                try:
+                    trade_params = FuturesOrder(
+                        type="market",
+                        side=action.lower(),
+                        margin=margin,
+                        leverage=leverage,
+                        stoploss=sl,
+                        takeprofit=tp
+                    )
+                    
+                    await client.futures.isolated.new_trade(trade_params)
+                    print("✅ ¡ORDEN AISLADA EJECUTADA EN LN MARKETS CON ÉXITO!")
+                except Exception as api_err:
+                    print(f"❌ Error de LN Markets al ejecutar: {api_err}")
+            else:
+                print("⏳ Manteniendo posición (HOLD). Bóveda intacta.")
+
+            brain.save_decision(current_price, action, decision.get('confidence'), decision.get('logic'), indicators=signals)
+            print("💾 Memoria actualizada.")
+
+    except Exception as e:
+        print(f"❌ Error crítico en el ciclo: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(run_trading_cycle())

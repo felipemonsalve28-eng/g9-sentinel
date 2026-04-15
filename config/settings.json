@@ -1,0 +1,14 @@
+{
+    "DB_PATH": "/home/felipemonsalve28/g9_production/data/g9_market.db",
+    "TELEGRAM": {
+        "TOKEN": "TU_TOKEN_REAL_AQUI",
+        "CHAT_ID": "TU_ID_REAL_AQUI"
+    },
+    "TRADING": {
+        "SYMBOL": "BTC-USD",
+        "RSI_PERIOD": 14,
+        "CVD_THRESHOLD": 0.5,
+        "MARGIN_RATIO": 0.15,
+        "LEVERAGE": 50
+    }
+}

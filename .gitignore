@@ -1,0 +1,19 @@
+# Credenciales y Variables de Entorno (CRÍTICO)
+.env
+
+# Entornos Virtuales y Caché
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bases de Datos Dinámicas y Logs
+data/
+*.db
+*.sqlite3
+logs/
+*.log
+
+# Directorio de Archivo (Deuda Técnica)
+archive/
