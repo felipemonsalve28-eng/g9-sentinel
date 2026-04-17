@@ -2,20 +2,24 @@ import asyncio
 import sys
 import warnings
 
-# Supresión de advertencias no críticas y aseguramiento del path
+# Aseguramos el path y silenciamos alertas de librerías
 warnings.filterwarnings('ignore')
 sys.path.append('/home/felipemonsalve28/g9_production')
 
-from core.engine import run_trading_cycle
+from core.engine import G9SentinelEngine
 
 if __name__ == "__main__":
     print("===================================================")
     print("🟢 G9-SENTINEL CORE ORCHESTRATOR INICIADO")
-    print("🔗 Arquitectura: Producción Consolidada (V14.6)")
+    print("🔗 Arquitectura: Motor Dual (5m/15m) V18")
     print("===================================================")
+    
     try:
-        asyncio.run(run_trading_cycle())
+        # Instanciamos el motor
+        engine = G9SentinelEngine()
+        # Ejecutamos el método de la clase
+        asyncio.run(engine.run_trading_cycle())
     except KeyboardInterrupt:
-        print("\n🛑 Apagado manual del sistema detectado.")
+        print("\n🛑 Apagado manual detectado.")
     except Exception as e:
         print(f"\n❌ Error crítico en el orquestador: {e}")
