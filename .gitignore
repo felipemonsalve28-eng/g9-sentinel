@@ -17,3 +17,5 @@ logs/
 
 # Directorio de Archivo (Deuda Técnica)
 archive/
+bot_output.log
+venv/

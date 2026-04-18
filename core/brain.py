@@ -1,109 +1,62 @@
-import sqlite3
 import os
 import json
+import sys
+import google.generativeai as genai
 from datetime import datetime
 
 class G9Brain:
-
-    def get_global_performance(self):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT winrate, delta_pnl FROM performance_logs ORDER BY id DESC LIMIT 1")
-            row = cursor.fetchone()
-            conn.close()
-            if row: return {"winrate": row[0], "delta": row[1]}
-        except: pass
-        return {"winrate": 50.0, "delta": 0.0}
-
-    def __init__(self, db_path='/home/felipemonsalve28/g9_production/data/g9_market.db'):
-        self.db_path = db_path
-        self._initialize_neural_pathways()
-
-    def _initialize_neural_pathways(self):
-        """Asegura que la estructura de la base de datos exista y sea correcta."""
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    SYSTEM_PROMPT = "Act as the Alpha-Predator V18. Your absolute goal is to ACCUMULATE SATS with a target of 35% DAILY GROWTH. Be aggressive but surgical. Use the provided memory to avoid repeated failures like the RSI 45 error. Prioritize Bitcoin accumulation above all else."
+    def __init__(self, api_key=None):
+        # Intentar obtener API_KEY de entorno si no se pasa
+        self.api_key = api_key or os.getenv('GEMINI_API_KEY')
+        if not self.api_key:
+            print("⚠️ [ERROR] No se encontró GEMINI_API_KEY", flush=True)
         
-        # Tabla optimizada para el análisis de la IA
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ai_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                market_price REAL,
-                action TEXT, -- BUY, SELL, HOLD
-                confidence INTEGER, -- 0 a 100
-                logic_applied TEXT, -- El razonamiento de Gemini
-                pnl_sats INTEGER DEFAULT 0,
-                indicators_snapshot TEXT  -- Resultado de la operación (clave para aprender)
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        print(f"[{datetime.now()}] Brain: G9Brain V18 (Stateful) online.", flush=True)
 
-    def get_context_for_gemini(self, limit=10):
-        """Extrae la memoria y la formatea como un bloque de contexto para el prompt."""
+    def get_decision(self, market_data, account_context, memory_context):
+        """
+        Calcula la siguiente acción basada en mercado + estado de cuenta + memoria.
+        """
+        master_prompt = f"""
+        Actúa como el Orquestador Alpha-Predator V18. 
+        Analiza con frialdad matemática y autocrítica.
+
+        CONTEXTO DE CUENTA:
+        {json.dumps(account_context, indent=2)}
+
+        MEMORIA OPERATIVA (Últimos trades):
+        {json.dumps(memory_context, indent=2)}
+
+        DATOS DE MERCADO ACTUALES:
+        {json.dumps(market_data, indent=2)}
+
+        RESPONDE EXCLUSIVAMENTE EN FORMATO JSON:
+        {{
+            "action": "BUY/SELL/HOLD",
+            "logic": "Tu razonamiento técnico incluyendo autocrítica.",
+            "confidence": 0.0-1.0
+        }}
+        """
+
         try:
-            conn = sqlite3.connect(self.db_path)
-            # Usamos Row para poder acceder a las columnas por nombre
-            conn.row_factory = sqlite3.Row 
-            cursor = conn.cursor()
+            response = self.model.generate_content(master_prompt)
+            raw_text = response.text.strip()
+            if "```json" in raw_text:
+                raw_text = raw_text.split("```json")[1].split("```")[0].strip()
             
-            cursor.execute('''
-                SELECT timestamp, market_price, action, confidence, logic_applied, pnl_sats 
-                FROM ai_decisions 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            ''', (limit,))
+            decision = json.loads(raw_text)
             
-            rows = cursor.fetchall()
-            conn.close()
-
-            if not rows:
-                return "[SISTEMA: No hay historial de trading previo. Esta es tu primera operación. Actúa con cautela y cíñete a tu estrategia base.]"
-
-            # Construimos el bloque de memoria para inyectar en el prompt
-            memory_block = "=== CONTEXTO HISTÓRICO: TUS ÚLTIMAS 10 DECISIONES ===\n"
-            memory_block += "Analiza estos resultados antes de tomar tu nueva decisión. Evita repetir lógicas que resultaron en PnL negativo.\n\n"
+            # Flush forzado para visibilidad en journalctl
+            print(f"IA_DECISION_TRACE: {json.dumps(decision)}", flush=True)
+            sys.stdout.flush()
             
-            for i, row in enumerate(rows, 1):
-                pnl_status = "GANANCIA" if row['pnl_sats'] > 0 else ("PÉRDIDA" if row['pnl_sats'] < 0 else "NEUTRAL")
-                memory_block += f"Operación -{i}:\n"
-                memory_block += f"  - Fecha/Hora: {row['timestamp']}\n"
-                memory_block += f"  - Precio BTC: ${row['market_price']}\n"
-                memory_block += f"  - Acción Tomada: {row['action']} (Confianza: {row['confidence']}%)\n"
-                memory_block += f"  - Tu Razonamiento: {row['logic_applied']}\n"
-                memory_block += f"  - Resultado: {row['pnl_sats']} SATS ({pnl_status})\n"
-                memory_block += "-" * 40 + "\n"
-
-            return memory_block
+            return decision
 
         except Exception as e:
-            return f"[SISTEMA: Error crítico al recuperar memoria: {e}. Opera basándote únicamente en los datos técnicos actuales.]"
+            print(f"ERROR_BRAIN: {str(e)}", flush=True)
+            sys.stdout.flush()
+            return {"action": "HOLD", "logic": "Modo defensivo por error técnico.", "confidence": 0}
 
-    def save_decision(self, market_price, action, confidence, logic_applied, indicators=None):
-        """Guarda la decisión actual para que sirva de memoria en el futuro."""
-        try:
-            import json
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            # Inserción limpia y explícita
-            cursor.execute('''
-                INSERT INTO ai_decisions (market_price, action, confidence, logic_applied, indicators_snapshot)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (market_price, action, confidence, logic_applied, json.dumps(indicators) if indicators else None))
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Error guardando memoria: {e}")
-            return False
-
-
-# --- Bloque de prueba ---
-if __name__ == "__main__":
-    brain = G9Brain()
-    print("🧠 Memoria inicializada correctamente.")
-    print("\nSimulando extracción de contexto para Gemini:")
-    print(brain.get_context_for_gemini(limit=3))
