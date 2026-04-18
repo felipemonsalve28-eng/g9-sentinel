@@ -1,3 +1,4 @@
+from core.context_manager import get_full_context, save_trade_result
 import os
 import json
 import asyncio
@@ -110,6 +111,11 @@ class G9SentinelEngine:
         Responde SOLO JSON: {{"action": "...", "new_stop_loss": 0, "logic": "...", "confidence": 0}}
         """
         try:
+            # --- G9-V18 Context Injection ---
+            # Obtenemos contexto (balance se pasa como argumento en seek_entries o se asume 0 en audit)
+            ctx_data = get_full_context({'total_balance': 0})
+            prompt = f"{prompt}\n\nCONTEXTO ACTUAL:\n{ctx_data}"
+            print(f"[BRAIN] Inyectando memoria de estado en el prompt...", flush=True)
             resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt)
             data = json.loads(resp.text.replace('```json', '').replace('```', '').strip())
 
@@ -122,6 +128,8 @@ class G9SentinelEngine:
             elif data.get("action") == "CLOSE_POSITION":
                 MClass = next(getattr(iso_models, n) for n in dir(iso_models) if 'Close' in n and 'All' not in n and 'Response' not in n)
                 await client.futures.isolated.close(MClass(id=pos.id))
+                save_trade_result('CLOSE', 0, 'Cierre ejecutado por auditoría de IA')
+                print(f"[MEMORY] Resultado de cierre almacenado.", flush=True)
                 self.notifier.send_alert(f"🚨 IA cerró posición: {pos.pl} SATS")
         except Exception as e:
             print(f"❌ Fallo en auditoría IA: {e}")
@@ -181,6 +189,11 @@ class G9SentinelEngine:
             }}
             """
         try:
+            # --- G9-V18 Context Injection ---
+            # Obtenemos contexto (balance se pasa como argumento en seek_entries o se asume 0 en audit)
+            ctx_data = get_full_context({'total_balance': 0})
+            prompt = f"{prompt}\n\nCONTEXTO ACTUAL:\n{ctx_data}"
+            print(f"[BRAIN] Inyectando memoria de estado en el prompt...", flush=True)
             resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt)
             data = json.loads(resp.text.replace('```json', '').replace('```', '').strip())
 
