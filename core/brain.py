@@ -8,11 +8,15 @@ class G9Brain:
         self.db_path = db_path
         self._initialize_neural_pathways()
 
+    def _get_conn(self):
+        # Añadimos timeout de 10s para evitar bloqueos entre Dashboard y Engine
+        return sqlite3.connect(self.db_path, timeout=10)
+
     def _initialize_neural_pathways(self):
-        """Asegura que la estructura de la base de datos exista y sea correcta."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
+        # Añadimos columna balance_sats si no existe
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,6 +26,7 @@ class G9Brain:
                 confidence INTEGER,
                 logic_applied TEXT,
                 pnl_sats INTEGER DEFAULT 0,
+                balance_sats INTEGER DEFAULT 0,
                 indicators_snapshot TEXT
             )
         ''')
@@ -29,13 +34,12 @@ class G9Brain:
         conn.close()
 
     def get_context_for_gemini(self, limit=10):
-        """Extrae la memoria para que Gemini no cometa los mismos errores."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT timestamp, market_price, action, confidence, logic_applied, pnl_sats 
+                SELECT timestamp, market_price, action, pnl_sats, balance_sats
                 FROM ai_decisions 
                 ORDER BY timestamp DESC LIMIT ?
             ''', (limit,))
@@ -47,23 +51,20 @@ class G9Brain:
 
             memory_block = "=== MEMORIA DE OPERACIONES RECIENTES ===\n"
             for row in rows:
-                status = "GANANCIA" if row['pnl_sats'] > 0 else "PÉRDIDA"
-                memory_block += f"- {row['timestamp']} | {row['action']} | {status} ({row['pnl_sats']} sats) | Logic: {row['logic_applied'][:50]}...\n"
+                memory_block += f"- {row['timestamp']} | {row['action']} | Bal: {row['balance_sats']} sats | PnL: {row['pnl_sats']}\n"
             return memory_block
         except Exception as e:
             return f"Error de memoria: {e}"
 
-    def save_decision(self, market_price, action, confidence, logic_applied, indicators=None):
-        """Guarda la decisión actual."""
+    def save_decision(self, market_price, action, confidence, logic_applied, indicators=None, balance=0):
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO ai_decisions (market_price, action, confidence, logic_applied, indicators_snapshot)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (market_price, action, confidence, logic_applied, json.dumps(indicators) if indicators else None))
+                INSERT INTO ai_decisions (market_price, action, confidence, logic_applied, indicators_snapshot, balance_sats)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (market_price, action, confidence, logic_applied, json.dumps(indicators) if indicators else None, balance))
             conn.commit()
-            cursor.close()
             conn.close()
             return True
         except Exception as e:
