@@ -63,6 +63,7 @@ class G9Brain:
                 VALUES (?, ?, ?, ?, ?)
             ''', (market_price, action, confidence, logic_applied, json.dumps(indicators) if indicators else None))
             conn.commit()
+            cursor.close()
             conn.close()
             return True
         except Exception as e:
