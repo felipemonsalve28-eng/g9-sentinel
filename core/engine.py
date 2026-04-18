@@ -159,7 +159,7 @@ class G9SentinelEngine:
         # ----------------------------------------------------
 
         print("🔭 [IA STRAT] Buscando nuevas entradas...")
-        memoria = self.brain.get_context_for_gemini(limit=5)
+        memoria = open('/home/felipemonsalve28/g9_production/data/session_memory.json').read() if __import__('os').path.exists('/home/felipemonsalve28/g9_production/data/session_memory.json') else '{}'
 
         prompt = f"""
             SISTEMA G9-SENTINEL V17.2: ALPHA-PREDATOR
@@ -180,7 +180,7 @@ class G9SentinelEngine:
             INSTRUCCIONES JSON:
             {{
                 "action": "{'HOLD' if at_limit else 'BUY, SELL o HOLD'}",
-                "margin": {int(balance * 0.60)},
+                "margin": {int(balance * 0.30)},
                 "leverage": 20,
                 "stop_loss": float,
                 "take_profit": float,
@@ -205,7 +205,7 @@ class G9SentinelEngine:
                     print("🛑 [ENGINE] Override automático: Límite 20 alcanzado. Forzando HOLD.")
                     data["action"] = "HOLD"
                 # -----------------------
-                mrg = min(data.get("margin", 1000), int(balance * 0.60))
+                mrg = min(data.get("margin", 1000), int(balance * 0.30))
                 lev = min(data.get("leverage", 5), 25)
                 order = FuturesOrder(
                     type='market', side=data['action'].lower(), margin=mrg, leverage=lev,
