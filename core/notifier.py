@@ -31,3 +31,25 @@ class G9Notifier:
         except Exception as e:
             print(f"❌ Error de red: {e}")
             return False
+
+    async def send_financial_report(self, stats):
+        try:
+            trend_emoji = "📈" if stats['delta_pnl'] >= 0 else "📉"
+            status = "🟢 AGRESIVO" if stats['winrate'] >= 45 and stats['delta_pnl'] >= 0 else "🛡️ CONSERVADOR"
+            
+            msg = f"🏦 <b>REPORTE FINANCIERO V16</b>\n"
+            msg += f"Estado IA: {status}\n\n"
+            msg += f"<pre>"
+            msg += f"Total PnL : {stats['total_pnl']} SATS\n"
+            msg += f"Delta 4H  : {stats['delta_pnl']} SATS {trend_emoji}\n"
+            msg += f"Winrate   : {stats['winrate']}%\n"
+            msg += f"ROI Global: {stats['roi']}%\n"
+            msg += f"Drawdown  : {stats['drawdown']} rachas"
+            msg += f"</pre>"
+            import httpx
+            url = f'https://api.telegram.org/bot{self.token}/sendMessage'
+            payload = {'chat_id': self.chat_id, 'text': msg, 'parse_mode': 'HTML'}
+            async with httpx.AsyncClient() as client:
+                await client.post(url, json=payload)
+        except Exception as e:
+            print(f"Error enviando reporte TG: {e}")

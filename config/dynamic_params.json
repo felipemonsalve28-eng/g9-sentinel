@@ -1,0 +1,10 @@
+{
+    "ADX_REGIME": "RANGING",
+    "MAX_LEVERAGE": 2,
+    "RSI_THRESHOLD_LOW": 25,
+    "RSI_THRESHOLD_HIGH": 75,
+    "FEE_COVERAGE_RATIO": 2.0,
+    "RISK_PER_TRADE": 0.01,
+    "STRATEGIC_NOTE": "El winrate del 100% no es estad\u00edsticamente significativo (n=1) y el par\u00e1metro 'logic_applied' es nulo. Se imponen l\u00edmites de riesgo estrictos y bajo apalancamiento hasta que el bot Junior demuestre una ejecuci\u00f3n basada en reglas algor\u00edtmicas validadas.",
+    "LAST_STRATEGIC_UPDATE": "2026-04-18 00:00:21"
+}

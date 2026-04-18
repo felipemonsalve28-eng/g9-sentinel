@@ -71,12 +71,16 @@ class G9SentinelEngine:
             current_atr = round(atr_df.iloc[-1], 2) if atr_df is not None else 0
             
             bb_width = 0
+            bb_upper = 0
+            bb_lower = 0
             if bb_df is not None and not bb_df.empty:
                 try:
                     # Extracción dinámica blindada contra cambios de versión de pandas_ta
                     upper_col = [c for c in bb_df.columns if 'BBU' in c][0]
                     lower_col = [c for c in bb_df.columns if 'BBL' in c][0]
-                    bb_width = round(bb_df[upper_col].iloc[-1] - bb_df[lower_col].iloc[-1], 2)
+                    bb_upper = round(bb_df[upper_col].iloc[-1], 2)
+                    bb_lower = round(bb_df[lower_col].iloc[-1], 2)
+                    bb_width = round(bb_upper - bb_lower, 2)
                 except IndexError:
                     bb_width = 0
 
@@ -84,7 +88,7 @@ class G9SentinelEngine:
                 "rsi": current_rsi,
                 "adx": current_adx,
                 "atr": current_atr,
-                "bb_width": bb_width,
+                "bb_width": bb_width, "bb_upper": bb_upper, "bb_lower": bb_lower,
                 "regimen": "TENDENCIA" if current_adx > 25 else "RANGO",
                 "trend": "SOBRECOMPRA" if current_rsi > 70 else ("SOBREVENTA" if current_rsi < 30 else "NEUTRAL")
             }
@@ -125,24 +129,70 @@ class G9SentinelEngine:
     async def seek_entries(self, client, balance, signals, price):
         """Modo Francotirador: Solo cada 15 minutos."""
         if balance < 2000: return
+
+        # --- BLOQUE V17.2: ALPHA-PREDATOR & RECOVERY MODE ---
+        if not hasattr(self, 'initial_balance_today'):
+            self.initial_balance_today = balance
+        
+        profit_needed = self.initial_balance_today * 0.35
+        current_profit = balance - self.initial_balance_today
+        progress_pct = (current_profit / profit_needed) * 100 if profit_needed > 0 else 0
+        
+        drawdown = (self.initial_balance_today - balance) / self.initial_balance_today if self.initial_balance_today > 0 else 0
+        recovery_active = drawdown > 0.15
+        
+        num_positions = len(getattr(self, 'positions', getattr(self, 'trades', getattr(self, 'active_trades', []))))
+        at_limit = num_positions >= 20
+
+        if recovery_active:
+            print(f"⚠️ [CLOUD ALERT] RECOVERY MODE ACTIVO: Drawdown {drawdown*100:.2f}%")
+        if at_limit:
+            print(f"🚫 [CLOUD ALERT] LÍMITE ALCANZADO: {num_positions}/20 posiciones.")
+        # ----------------------------------------------------
+
         print("🔭 [IA STRAT] Buscando nuevas entradas...")
         memoria = self.brain.get_context_for_gemini(limit=5)
 
         prompt = f"""
-        SISTEMA SNIPER G9 V18 (ALPHA SEEKER)
-        Contexto: {memoria}
-        Balance: {balance} | RSI: {signals['rsi']} | ADX: {signals['adx']} | ATR: {signals['atr']} | BB Width: {signals['bb_width']}
-        
-        REGLA DE RENTABILIDAD ESTRICTA: El ATR actual ({signals['atr']}) y la amplitud de bandas ({signals['bb_width']}) representan la volatilidad. Si la volatilidad es muy baja, los movimientos no cubrirán las comisiones del broker. Responde "HOLD" si el Alpha de volatilidad es pobre.
-        
-        ¿BUY/SELL/HOLD? JSON: {{"action": "...", "margin": 0, "leverage": 0, "stop_loss": 0, "take_profit": 0, "logic": "..."}}
-        """
+            SISTEMA G9-SENTINEL V17.2: ALPHA-PREDATOR
+            -----------------------------------------------------------
+            ESTADO: {'🚨 MODO RECUPERACIÓN (Alta Precisión)' if recovery_active else '✅ OPERACIÓN ALPHA'}
+            POSICIONES ACTIVAS: {num_positions}/20
+            PROGRESO DIARIO: {progress_pct:.2f}% (Meta: +35%)
+            
+            SNAPSHOT TÉCNICO:
+            - Precio BTC: ${price}
+            - RSI: {signals.get('rsi', 'N/A')}
+            
+            PROTOCOLO DE EJECUCIÓN:
+            1. {'ESTRATEGIA RECOVERY: Detén pérdidas. Scalping seguro para recuperar drawdown.' if recovery_active else 'ESTRATEGIA ALPHA: Entra agresivo si RSI está en 45-55.'}
+            2. Riesgo fijado al 60%. Error de stop-loss inaceptable.
+            3. {'LÍMITE DE POSICIONES ALCANZADO. Tu única acción permitida es HOLD.' if at_limit else 'Capacidad operativa disponible.'}
+            
+            INSTRUCCIONES JSON:
+            {{
+                "action": "{'HOLD' if at_limit else 'BUY, SELL o HOLD'}",
+                "margin": {int(balance * 0.60)},
+                "leverage": 20,
+                "stop_loss": float,
+                "take_profit": float,
+                "confidence": 1-100,
+                "logic": "Análisis táctico justificado"
+            }}
+            """
         try:
             resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt)
             data = json.loads(resp.text.replace('```json', '').replace('```', '').strip())
 
-            if data.get("action") in ["BUY", "SELL"]:
-                mrg = min(data.get("margin", 1000), int(balance * 0.15))
+            confidence = data.get("confidence", 0)
+            if data.get("action") in ["BUY", "SELL"] and confidence > 65:
+                
+                # --- FAIL-SAFE V17.2 ---
+                if at_limit and data.get("action") in ["BUY", "SELL"]:
+                    print("🛑 [ENGINE] Override automático: Límite 20 alcanzado. Forzando HOLD.")
+                    data["action"] = "HOLD"
+                # -----------------------
+                mrg = min(data.get("margin", 1000), int(balance * 0.60))
                 lev = min(data.get("leverage", 5), 25)
                 order = FuturesOrder(
                     type='market', side=data['action'].lower(), margin=mrg, leverage=lev,
@@ -152,6 +202,8 @@ class G9SentinelEngine:
                 await client.futures.isolated.new_trade(order)
                 self.notifier.send_alert(f"🚀 Sniper {data['action']} ejecutado a ${price} | Lógica V18")
                 print(f"✅ Trade {data['action']} enviado a LNM.")
+            elif data.get("action") in ["BUY", "SELL"]:
+                print(f"🛡️ Filtro de Confianza: IA sugirió {data.get('action')} con {confidence}% (Requiere > 65). Abortando. Lógica: {data.get('logic', '')}")
             else:
                 print(f"⏳ IA decidió HOLD. Lógica: {data.get('logic', 'Sin lógica provista')}")
         except Exception as e:

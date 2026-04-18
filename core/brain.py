@@ -4,6 +4,18 @@ import json
 from datetime import datetime
 
 class G9Brain:
+
+    def get_global_performance(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT winrate, delta_pnl FROM performance_logs ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+            if row: return {"winrate": row[0], "delta": row[1]}
+        except: pass
+        return {"winrate": 50.0, "delta": 0.0}
+
     def __init__(self, db_path='/home/felipemonsalve28/g9_production/data/g9_market.db'):
         self.db_path = db_path
         self._initialize_neural_pathways()
