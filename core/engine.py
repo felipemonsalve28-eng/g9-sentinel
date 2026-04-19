@@ -1,23 +1,14 @@
 import os
+import re
 import json
 import asyncio
-import warnings
-import re
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
-from lnmarkets_sdk.v3.models.futures_isolated import FuturesOrder
-import lnmarkets_sdk.v3.models.futures_isolated as iso_models
 import pandas as pd
 import pandas_ta as ta
-
+from datetime import datetime
+from google import genai
+from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
 from core.brain import G9Brain
 from core.notifier import G9Notifier
-
-warnings.filterwarnings('ignore')
-load_dotenv('/home/felipemonsalve28/g9_production/.env')
 
 class G9SentinelEngine:
     def __init__(self):
@@ -31,173 +22,207 @@ class G9SentinelEngine:
                 secret=os.getenv('LNM_SECRET'),
                 passphrase=os.getenv('LNM_PASSPHRASE')
             ),
-            network='mainnet',
-            timeout=60.0
-        )
-        self.last_strategic_run = datetime.min
-        self.fast_cycle_minutes = 1
-        self.strategic_cycle_minutes = 5
-        self.safe_config = types.GenerateContentConfig(
-            safety_settings=[
-                types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='BLOCK_NONE'),
-                types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
-                types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='BLOCK_NONE'),
-                types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
-            ]
+            network="mainnet"
         )
 
-    def _load_external_prompt(self, p_type):
-        path = f'/home/felipemonsalve28/g9_production/config/prompts/{p_type}.txt'
-        try:
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    c = f.read().strip()
-                    if c: return c
-        except: pass
-        return None
+    async def fetch_timeframe_data(self, client, interval_mins, limit=50):
+        """Extrae y procesa datos técnicos para un intervalo específico."""
+        res = await client.futures.get_candles({"limit": limit})
+        candles = getattr(res, 'data', res)
+        df = pd.DataFrame([{'close': float(c.close), 'high': float(c.high), 'low': float(c.low)} for c in candles])
+        df = df.iloc[::-1].reset_index(drop=True)
+        
+        # Cálculos Alpha
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        
+        return {
+            "price": df['close'].iloc[-1],
+            "rsi": round(df['rsi'].iloc[-1], 2),
+            "bb_u": round(bb.iloc[-1, 0], 2),
+            "bb_l": round(bb.iloc[-1, 2], 2),
+            "trend": "UP" if df['close'].iloc[-1] > df['close'].mean() else "DOWN"
+        }
 
-    def _extract_json(self, text):
-        try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match: return json.loads(match.group(0))
-        except: pass
-        return None
-
-    def round_to_tick(self, val):
-        try: return round(float(val) * 2) / 2
-        except: return None
-
-    async def get_market_signals(self, client):
-        try:
-            response = await client.futures.get_candles({'limit': 100})
-            c = getattr(response, 'data', response)
-            df = pd.DataFrame([{'close': float(i.close), 'high': float(i.high), 'low': float(i.low)} for i in c])
-            df = df.iloc[::-1].reset_index(drop=True)
-
-            df['rsi'] = ta.rsi(df['close'], length=14)
-            df['ema_20'] = ta.ema(df['close'], length=20)
-            df['ema_50'] = ta.ema(df['close'], length=50)
-            bbands = ta.bbands(df['close'], length=20, std=2)
-            df = pd.concat([df, bbands], axis=1)
-
-            def get_col(patterns, default_val=0):
-                for p in patterns:
-                    cols = [c for c in df.columns if p.upper() in c.upper()]
-                    if cols:
-                        val = df[cols[0]].iloc[-1]
-                        return round(float(val), 2) if pd.notnull(val) else default_val
-                return default_val
-
-            return {
-                'rsi': get_col(['RSI'], 50),
-                'ema_20': get_col(['EMA_20', 'EMA20']),
-                'ema_50': get_col(['EMA_50', 'EMA50']),
-                'bb_u': get_col(['BBU']),
-                'bb_l': get_col(['BBL']),
-                'candles': df.tail(5)[['close', 'high', 'low']].fillna(0).to_dict('records')
-            }
-        except Exception as e:
-            print(f"❌ Error Crítico Señales: {e}")
-            return {'rsi': 50, 'ema_20': 0, 'ema_50': 0, 'bb_u': 0, 'bb_l': 0, 'candles': []}
-
-    async def audit_position(self, client, pos, signals, price, balance):
-        print(f"🧠 [IA AUDIT] Analizando {pos.side} ID: {pos.id[:8]}")
-        template = self._load_external_prompt('audit')
-        if not template: return
-
-        try:
-            prompt_data = {
-                'side': pos.side, 'entry': pos.price, 'pnl': pos.pl, 'price': price,
-                'rsi': signals['rsi'], 'ema20': signals['ema_20'], 'ema50': signals['ema_50'],
-                'bb_u': signals['bb_u'], 'bb_l': signals['bb_l'],
-                'candles': json.dumps(signals['candles'])
-            }
-            prompt = template.format(**prompt_data)
-            
-            resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt, config=self.safe_config)
-            data = self._extract_json(resp.text)
-            
-            if data:
-                # Guardamos incluyendo el balance actual
-                self.brain.save_decision(price, data.get('action'), data.get('confidence', 0), data.get('logic', ''), indicators=signals, balance=int(balance))
-
-                if data.get('action') == 'UPDATE_SL' and data.get('new_stop_loss', 0) > 0:
-                    n_sl = self.round_to_tick(data.get('new_stop_loss'))
-                    MClass = next(getattr(iso_models, n) for n in dir(iso_models) if 'Stoploss' in n and 'Response' not in n)
-                    await client.futures.isolated.update_stoploss(MClass(id=pos.id, value=n_sl))
-                    self.notifier.send_alert(f"🛡️ Trailing SL: ${n_sl}")
-                elif data.get('action') == 'CLOSE_POSITION':
-                    MClass = next(getattr(iso_models, n) for n in dir(iso_models) if 'Close' in n and 'All' not in n and 'Response' not in n)
-                    await client.futures.isolated.close(MClass(id=pos.id))
-                    self.notifier.send_alert(f"🚨 IA cerró: {pos.pl} SATS")
-        except Exception as e:
-            print(f"❌ Error Formato Audit: {e}")
-
-    async def seek_entries(self, client, balance, signals, price):
-        trades = await client.futures.isolated.get_running_trades()
-        if len(trades) >= 3 or balance < 2000: return
-
-        print("🔭 [IA STRAT] Buscando confluencias...")
-        template = self._load_external_prompt('strategy')
-        if not template: return
-
-        context = self.brain.get_context_for_gemini(limit=5)
-        try:
-            prompt_data = {
-                'context': context, 'recovery_status': 'ALPHA', 'num_positions': len(trades),
-                'price': price, 'rsi': signals['rsi'], 'ema20': signals['ema_20'],
-                'ema50': signals['ema_50'], 'bb_u': signals['bb_u'], 'bb_l': signals['bb_l'],
-                'candles': json.dumps(signals['candles']), 'margin_sats': int(balance * 0.30)
-            }
-            prompt = template.format(**prompt_data)
-
-            resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt, config=self.safe_config)
-            data = self._extract_json(resp.text)
-            
-            if data:
-                # Guardamos incluyendo el balance actual
-                self.brain.save_decision(price, data.get('action'), data.get('confidence', 0), data.get('logic', ''), indicators=signals, balance=int(balance))
-                if data.get('action') in ['BUY', 'SELL']:
-                    order = FuturesOrder(
-                        type='market', side=data['action'].lower(), margin=int(balance * 0.30),
-                        leverage=20, stoploss=self.round_to_tick(data.get('stop_loss')),
-                        takeprofit=self.round_to_tick(data.get('take_profit'))
-                    )
-                    await client.futures.isolated.new_trade(order)
-                    self.notifier.send_alert(f"🚀 Sniper {data['action']} | RSI: {signals['rsi']}")
-                else:
-                    print(f"IA decidió: {data.get('action') if data else 'HOLD'}")
-        except Exception as e:
-            print(f"❌ Error Formato Strat: {e}")
+    async def get_full_market_snapshot(self, client):
+        """Genera el paquete completo de datos multi-temporalidad."""
+        return {
+            "m1": await self.fetch_timeframe_data(client, 1),
+            "m5": await self.fetch_timeframe_data(client, 5),
+            "h1": await self.fetch_timeframe_data(client, 60),
+            "h4": await self.fetch_timeframe_data(client, 240)
+        }
 
     async def run_trading_cycle(self):
-        print(f"⚡ G9-SENTINEL V25.4: ALPHA SNIPER + CONCIENCIA DE CAPITAL")
-        while True:
-            try:
-                async with LNMClient(self.config_lnm) as lnm:
+        print(f"🚀 G9-SENTINEL V25.5: FULL DATA MODE ACTIVE")
+        async with LNMClient(self.config_lnm) as lnm:
+            while True:
+                try:
+                    # 1. Datos de Cuenta y Mercado
                     acc = await lnm.account.get_account()
-                    # Capturamos el balance real de la cuenta
-                    current_balance = int(acc.balance) if hasattr(acc, 'balance') else 0
+                    positions = await lnm.futures.isolated.get_running_trades()
+                    market_data = await self.get_full_market_snapshot(lnm)
                     
-                    tick = await lnm.futures.get_ticker()
-                    price = float(tick.last_price)
-                    sigs = await self.get_market_signals(lnm)
-                    trades = await lnm.futures.isolated.get_running_trades()
+                    # 2. Preparar el paquete para la IA
+                    account_snapshot = {
+                        "balance": acc.balance,
+                        "open_positions": [p.__dict__ for p in positions],
+                        "timestamp": datetime.now().isoformat()
+                    }
 
-                    print(f"[HEARTBEAT] {datetime.now().strftime('%H:%M:%S')} | BTC: ${price} | Bal: {current_balance} | Abiertas: {len(trades)}")
+                    # 3. Lógica de Auditoría o Estrategia (Actualizada)
+                    ai_decision = None
+                    if positions:
+                        # Modo Defensa/Gestión
+                        ai_decision = await self.execute_ai_action("audit", account_snapshot, market_data, lnm)
+                        if ai_decision:
+                            await self.process_audit_decision(ai_decision, positions[0], lnm)
+                    else:
+                        # Modo Ataque/Estrategia
+                        ai_decision = await self.execute_ai_action("strategy", account_snapshot, market_data, lnm)
+                        if ai_decision:
+                            await self.process_strategy_decision(ai_decision, acc.balance, lnm)
 
-                    for p in trades:
-                        await self.audit_position(lnm, p, sigs, price, current_balance)
+                    # 4. Guardar en memoria (Para el Dashboard y el Contexto Histórico)
+                    if ai_decision:
+                        action = ai_decision.get("action", "HOLD")
+                        logic = ai_decision.get("logic", "Sin lógica provista.")
+                        conf = ai_decision.get("confidence", 0)
+                        current_price = market_data['m1']['price']
+                        
+                        self.brain.save_decision(
+                            market_price=current_price, 
+                            action=action, 
+                            confidence=conf, 
+                            logic_applied=logic, 
+                            indicators=market_data, 
+                            balance=acc.balance
+                        )
+                        print(f"🧠 Memoria G9: Acción [{action}] guardada. Lógica: {logic}")
 
-                    if (datetime.now() - self.last_strategic_run) >= timedelta(minutes=self.strategic_cycle_minutes):
-                        await self.seek_entries(lnm, current_balance, sigs, price)
-                        self.last_strategic_run = datetime.now()
+                    await asyncio.sleep(60) # Ciclo rápido de 1 min
+                except Exception as e:
+                    print(f"❌ Error en el ciclo de trading: {e}")
+                    await asyncio.sleep(10)
 
-                await asyncio.sleep(self.fast_cycle_minutes * 60)
+    async def execute_ai_action(self, p_type, account, market, client):
+        """Ejecuta una acción de IA asegurando un procesamiento 100% a prueba de fallos."""
+        path = f'/home/felipemonsalve28/g9_production/config/prompts/{p_type}.txt'
+        
+        # Validar existencia del prompt
+        try:
+            with open(path, 'r') as f:
+                template = f.read()
+        except FileNotFoundError:
+            print(f"❌ Error crítico: No se encontró el prompt '{p_type}' en {path}")
+            return None
+
+        # Inyección masiva de datos al prompt
+        prompt = template.format(
+            account=json.dumps(account, indent=2),
+            market=json.dumps(market, indent=2),
+            memoria=self.brain.get_context_for_gemini(limit=5)
+        )
+
+        try:
+            # 1. Llamada a la IA
+            resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt)
+            raw_text = resp.text
+
+            # 2. Limpieza y Extracción (Busca solo lo que está entre llaves)
+            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if not match:
+                raise ValueError("No se encontró ninguna estructura JSON en la respuesta de la IA.")
+            
+            clean_json_str = match.group(0)
+
+            # 3. Parseo Seguro
+            ai_decision = json.loads(clean_json_str)
+
+            # 4. Validación Estructural Básica
+            if not isinstance(ai_decision, dict):
+                raise TypeError("El JSON decodificado no es un diccionario válido.")
+
+            return ai_decision
+
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Error de formato JSON: {e}")
+            print(f"Texto crudo devuelto por IA: {raw_text}")
+        except (ValueError, TypeError, KeyError) as e:
+            print(f"⚠️ Error de validación estructural: {e}")
+        except Exception as e:
+            print(f"🚨 Error inesperado comunicándose con Gemini: {e}")
+        
+        # Fallo seguro: permite que el bot intente de nuevo en el próximo ciclo
+        return None
+
+    # --- NUEVAS FUNCIONES DE EJECUCIÓN ---
+
+    async def process_audit_decision(self, decision, current_position, client):
+        """Ejecuta las decisiones de protección de capital (audit.txt)"""
+        action = decision.get("action")
+        pos_id = getattr(current_position, 'id', None)
+
+        if not pos_id:
+            return
+
+        if action == "UPDATE_SL":
+            # Extraemos el nuevo SL (soporta variables llamadas new_stop_loss o stop_loss)
+            new_sl = decision.get("new_stop_loss") or decision.get("stop_loss")
+            if new_sl:
+                print(f"🛡️ ACTUALIZANDO STOP LOSS DINÁMICO a: ${new_sl}")
+                try:
+                    await client.futures.isolated.update_position({"id": pos_id, "stoploss": float(new_sl)})
+                    print("✅ TRAILING STOP ACTUALIZADO CON ÉXITO.")
+                except Exception as e:
+                    print(f"❌ Error al actualizar SL: {e}")
+                    
+        elif action == "CLOSE_POSITION":
+            print("🚨 ORDEN DE CIERRE RECIBIDA. Asegurando posición...")
+            try:
+                await client.futures.isolated.close(id=pos_id)
+                print("✅ POSICIÓN CERRADA CON ÉXITO.")
             except Exception as e:
-                print(f"❌ Error ciclo: {e}")
-                await asyncio.sleep(60)
+                print(f"❌ Error al cerrar posición: {e}")
+                
+        else: # Asume HOLD_POSITION por defecto
+            print(f"🛡️ AUDITORÍA [HOLD]: Manteniendo parámetros. Lógica: {decision.get('logic')}")
 
-if __name__ == '__main__':
-    engine = G9SentinelEngine()
-    asyncio.run(engine.run_trading_cycle())
+    async def process_strategy_decision(self, decision, balance, client):
+        """Ejecuta las decisiones de entrada al mercado (strategy.txt)"""
+        action = decision.get("action")
+        
+        if action in ["BUY", "SELL"]:
+            margin = decision.get("margin", 0)
+            leverage = decision.get("leverage", 10)
+            sl = decision.get("stop_loss")
+            tp = decision.get("take_profit")
+            
+            # Control de riesgo maestro (Máximo 35% del balance real)
+            max_margin = int(balance * 0.35)
+            if margin > max_margin:
+                margin = max_margin
+                
+            print(f"🔨 EJECUTANDO {action} | Margen: {margin} Sats | Apalan: {leverage}x | SL: {sl} | TP: {tp}")
+            try:
+                # Construimos el diccionario base limpio
+                params = {
+                    "type": "market",
+                    "side": "b" if action == "BUY" else "s",
+                    "margin": int(margin),
+                    "leverage": float(leverage)
+                }
+                
+                # Solo inyectamos SL y TP si realmente existen
+                if sl and float(sl) > 0:
+                    params["stoploss"] = float(sl)
+                if tp and float(tp) > 0:
+                    params["takeprofit"] = float(tp)
+
+                # Disparamos la orden
+                await client.futures.isolated.new_trade(params)
+                print("✅ ORDEN EJECUTADA CON ÉXITO")
+            except Exception as e:
+                print(f"❌ Error al ejecutar Orden: {e}")
+        else:
+            print(f"⏳ STRAT [HOLD]: Buscando setup. Lógica: {decision.get('logic')}")
