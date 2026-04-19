@@ -159,70 +159,79 @@ class G9SentinelEngine:
     # --- NUEVAS FUNCIONES DE EJECUCIÓN ---
 
     async def process_audit_decision(self, decision, current_position, client):
-        """Ejecuta las decisiones de protección de capital (audit.txt)"""
+        """Ejecuta las decisiones de protección de capital con datos normalizados"""
         action = decision.get("action")
-        pos_id = getattr(current_position, 'id', None)
+        
+        # Extracción segura y limpieza total del ID para evitar fallos de firma
+        pos_id = str(getattr(current_position, 'id', '')).strip()
 
-        if not pos_id:
+        if not pos_id or pos_id == "":
             return
 
         if action == "UPDATE_SL":
-            # Extraemos el nuevo SL (soporta variables llamadas new_stop_loss o stop_loss)
             new_sl = decision.get("new_stop_loss") or decision.get("stop_loss")
             if new_sl:
-                print(f"🛡️ ACTUALIZANDO STOP LOSS DINÁMICO a: ${new_sl}")
+                # Forzamos ENTERO para que la firma no se rompa con decimales .0
+                clean_sl = int(float(new_sl))
+                print(f"🛡️ ACTUALIZANDO SL a: {clean_sl} | ID: {pos_id}")
                 try:
-                    await client.futures.isolated.update_position({"id": pos_id, "stoploss": float(new_sl)})
+                    # Formato explícito para asegurar la consistencia del Hash de la firma
+                    await client.futures.isolated.update_position({"id": pos_id, "stoploss": clean_sl})
                     print("✅ TRAILING STOP ACTUALIZADO CON ÉXITO.")
                 except Exception as e:
                     print(f"❌ Error al actualizar SL: {e}")
                     
         elif action == "CLOSE_POSITION":
-            print("🚨 ORDEN DE CIERRE RECIBIDA. Asegurando posición...")
+            print(f"🚨 CIERRE TÁCTICO: Solicitando cierre de {pos_id}...")
             try:
-                await client.futures.isolated.close(id=pos_id)
-                print("✅ POSICIÓN CERRADA CON ÉXITO.")
+                # Enviamos como diccionario para que el SDK procese el body POST correctamente
+                await client.futures.isolated.close({"id": pos_id})
+                print(f"✅ POSICIÓN {pos_id} CERRADA CON ÉXITO.")
             except Exception as e:
                 print(f"❌ Error al cerrar posición: {e}")
-                
-        else: # Asume HOLD_POSITION por defecto
-            print(f"🛡️ AUDITORÍA [HOLD]: Manteniendo parámetros. Lógica: {decision.get('logic')}")
-
+        else:
+            print(f"🛡️ AUDITORÍA [HOLD]: {decision.get('logic', 'Sin cambios')}")
     async def process_strategy_decision(self, decision, balance, client):
-        """Ejecuta las decisiones de entrada al mercado (strategy.txt)"""
+        """Ejecuta las decisiones de entrada con formato ultra-estricto para LNM v3"""
         action = decision.get("action")
         
         if action in ["BUY", "SELL"]:
-            margin = decision.get("margin", 0)
-            leverage = decision.get("leverage", 10)
-            sl = decision.get("stop_loss")
-            tp = decision.get("take_profit")
-            
-            # Control de riesgo maestro (Máximo 35% del balance real)
-            max_margin = int(balance * 0.35)
-            if margin > max_margin:
-                margin = max_margin
-                
-            print(f"🔨 EJECUTANDO {action} | Margen: {margin} Sats | Apalan: {leverage}x | SL: {sl} | TP: {tp}")
             try:
-                # Construimos el diccionario base limpio
+                # 1. Limpieza de tipos de datos (Forzamos Integers para evitar líos de firma)
+                margin = int(float(decision.get("margin", 1000)))
+                leverage = int(float(decision.get("leverage", 10)))
+                
+                # 2. Control de riesgo
+                max_margin = int(balance * 0.35)
+                if margin > max_margin: margin = max_margin
+                
+                # 3. Mapeo de lado
+                side_mapped = "buy" if action == "BUY" else "sell"
+                
+                # 4. Construcción del Payload (Orden de parámetros estándar de LNM)
                 params = {
                     "type": "market",
-                    "side": "b" if action == "BUY" else "s",
-                    "margin": int(margin),
-                    "leverage": float(leverage)
+                    "side": side_mapped,
+                    "margin": margin,
+                    "leverage": leverage
                 }
                 
-                # Solo inyectamos SL y TP si realmente existen
+                # 5. Precios como Enteros (BTC no necesita decimales en LNM Futures)
+                sl = decision.get("stop_loss")
+                tp = decision.get("take_profit")
+                
                 if sl and float(sl) > 0:
-                    params["stoploss"] = float(sl)
+                    params["stoploss"] = int(float(sl))
                 if tp and float(tp) > 0:
-                    params["takeprofit"] = float(tp)
-
-                # Disparamos la orden
+                    params["takeprofit"] = int(float(tp))
+                
+                print(f"🔨 DISPARANDO {action.upper()} | Margen: {margin} | Palanca: {leverage}x | SL: {params.get('stoploss')}")
+                
+                # 6. Ejecución
                 await client.futures.isolated.new_trade(params)
-                print("✅ ORDEN EJECUTADA CON ÉXITO")
+                print(f"✅ ORDEN {action} EJECUTADA CON ÉXITO")
+                
             except Exception as e:
-                print(f"❌ Error al ejecutar Orden: {e}")
+                print(f"❌ RECHAZO DE BROKER (Signature/Params): {e}")
         else:
-            print(f"⏳ STRAT [HOLD]: Buscando setup. Lógica: {decision.get('logic')}")
+            print(f"⏳ STRAT [HOLD]: {decision.get('logic', 'Sin señal clara')}")
