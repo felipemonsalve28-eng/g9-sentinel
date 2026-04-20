@@ -4,7 +4,7 @@ import json
 import asyncio
 import pandas as pd
 import pandas_ta as ta
-from datetime import datetime, timedelta, timezone # Añadido para el manejo de tiempo
+from datetime import datetime, timedelta, timezone
 from google import genai
 from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
 from core.brain import G9Brain
@@ -33,33 +33,22 @@ class G9SentinelEngine:
         """Extrae datos técnicos cumpliendo con el requisito 'from_' del SDK v3."""
         range_map = {1: "1m", 5: "5m", 60: "1h", 240: "4h"}
         tf_range = range_map.get(interval_mins, "1m")
-
-        # CÁLCULO DEL TIEMPO (Requerido por el SDK v3)
-        # Pedimos el doble del límite en tiempo para asegurar que la API devuelva datos suficientes
         start_time = (datetime.now(timezone.utc) - timedelta(minutes=interval_mins * limit * 2))
         from_timestamp = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
         try:
-            # FIX: Se añade from_ que es obligatorio en GetCandlesParams
-            params = GetCandlesParams(
-                limit=limit, 
-                range=tf_range, 
-                from_=from_timestamp 
-            )
+            params = GetCandlesParams(limit=limit, range=tf_range, from_=from_timestamp)
             res = await client.futures.get_candles(params)
             candles = getattr(res, 'data', res)
             
-            if not candles or len(candles) < 14: # Necesitamos al menos 14 para el RSI
+            if not candles or len(candles) < 14:
                 return None
 
             df = pd.DataFrame([{'close': float(c.close), 'high': float(c.high), 'low': float(c.low)} for c in candles])
-            # El SDK v3 suele devolver de nuevo a viejo, invertimos para análisis
             df = df.iloc[::-1].reset_index(drop=True)
             
-            # Indicadores
             df['rsi'] = ta.rsi(df['close'], length=14)
             bb = ta.bbands(df['close'], length=20, std=2)
-            
             bbl_col = [c for c in bb.columns if 'BBL' in c][0]
             bbu_col = [c for c in bb.columns if 'BBU' in c][0]
             
@@ -71,12 +60,10 @@ class G9SentinelEngine:
                 "trend": "UP" if df['close'].iloc[-1] > df['close'].rolling(20).mean().iloc[-1] else "DOWN"
             }
         except Exception as e:
-            # El error de validación de Pydantic ya no debería aparecer
             print(f"⚠️ Error en velas {tf_range}: {e}")
             return None
 
     async def get_full_market_snapshot(self, client):
-        """Genera el paquete multi-temporalidad."""
         return {
             "m1": await self.fetch_timeframe_data(client, 1),
             "m5": await self.fetch_timeframe_data(client, 5),
@@ -121,6 +108,24 @@ class G9SentinelEngine:
                         if ai_decision:
                             await self.process_strategy_decision(ai_decision, acc.balance, lnm)
 
+                    # --- ESCRITURA EN DB (Ajustada a tu esquema real) ---
+                    if ai_decision:
+                        # Extraemos datos de la posición para la DB si existe
+                        current_pnl = formatted_positions[0]['pnl'] if formatted_positions else 0
+                        current_margin = formatted_positions[0]['margin'] if formatted_positions else 0
+                        
+                        self.brain.save_decision(
+                            market_price=market_data['m1']['price'],
+                            action=ai_decision.get("action", "HOLD"),
+                            confidence=ai_decision.get("confidence", 0),
+                            logic_applied=ai_decision.get("logic", "N/A"),
+                            indicators=market_data,
+                            balance=acc.balance,
+                            pnl=current_pnl,      # Para pnl_sats
+                            margin=current_margin  # Para margin
+                        )
+                        print(f"🧠 Memoria G9: Registro guardado en DB (PnL: {current_pnl} sats).")
+
                     await asyncio.sleep(60)
                 except Exception as e:
                     print(f"❌ Error en el ciclo: {e}")
@@ -151,14 +156,11 @@ class G9SentinelEngine:
             if val:
                 try:
                     clean_val = int(float(val))
-                    print(f"🛡️ ACTUALIZANDO SL a: {clean_val}")
-                    # Usamos el modelo del SDK para asegurar compatibilidad
                     params = UpdateStoplossParams(id=pos_id, value=clean_val)
                     await client.futures.isolated.update_stoploss(params)
-                    print("✅ SL ACTUALIZADO CON ÉXITO.")
+                    print(f"✅ SL ACTUALIZADO a {clean_val}")
                 except Exception as e:
                     print(f"❌ Error al actualizar SL: {e}")
-                        
         elif action == "CLOSE_POSITION":
             try:
                 await client.futures.isolated.close(id=pos_id)
