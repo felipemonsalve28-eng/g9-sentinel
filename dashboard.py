@@ -1,139 +1,136 @@
 import sqlite3
+import json
 import time
 import os
-import json
+from datetime import datetime
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
 from rich.layout import Layout
+from rich.panel import Panel
 from rich.live import Live
 from rich.text import Text
-from datetime import datetime
+from rich import box
 
 console = Console()
 DB_PATH = '/home/felipemonsalve28/g9_production/data/g9_market.db'
 
-def get_latest_data():
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM ai_decisions ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        return row
-    except:
-        return None
+class G9Dashboard:
+    def __init__(self, path):
+        self.db_path = path
 
-def make_layout() -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="account", size=8),
-        Layout(name="market", size=10),
-        Layout(name="footer", size=10)
-    )
-    return layout
-
-def generate_ui():
-    data = get_latest_data()
-    layout = make_layout()
-    
-    # 1. HEADER
-    layout["header"].update(Panel(
-        Text(f"🛰️ G9-SENTINEL V25.5 | {datetime.now().strftime('%H:%M:%S')}", justify="center", style="bold white on blue")
-    ))
-
-    if data:
-        # 🛠️ CORRECCIÓN: Convertimos el objeto sqlite3.Row a un diccionario de Python
-        data = dict(data)
-
-        # --- 2. PANEL DE CUENTA Y ACCIÓN ---
-        action = data.get('action', 'WAIT')
-        action_style = "bold green" if action == "BUY" else "bold red" if action == "SELL" else "bold yellow"
-        
-        acc_table = Table.grid(expand=True)
-        acc_table.add_column(style="bold cyan", width=20)
-        acc_table.add_column()
-        
+    def get_telemetry(self):
         try:
-            bal = data.get('balance_sats', 0)
-        except:
-            bal = 0
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
             
-        acc_table.add_row("BÓVEDA ACTUAL:", f"[bold white]{bal:,} Sats[/bold white]")
-        acc_table.add_row("ÚLTIMA ACCIÓN:", Text(action, style=action_style))
-        acc_table.add_row("PRECIO BTC:", f"[bold yellow]${data.get('market_price', 'N/A')}[/bold yellow]")
-        acc_table.add_row("CONFIANZA IA:", f"[bold magenta]{data.get('confidence', '0')}%[/bold magenta]")
+            # Apuntamos directamente a la tabla reina
+            table = "ai_decisions"
+            
+            # Obtenemos los nombres de las columnas para no fallar en el mapeo
+            cursor.execute(f"PRAGMA table_info({table})")
+            cols = [c[1] for c in cursor.fetchall()]
+            
+            # Traemos la última fila
+            cursor.execute(f"SELECT * FROM {table} ORDER BY ROWID DESC LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                return "⚠️ Tabla 'ai_decisions' encontrada pero está vacía."
+
+            # Creamos un diccionario con los datos reales
+            data = dict(zip(cols, row))
+            
+            # Procesar el JSON de indicadores (que suele venir en la columna 'indicators')
+            indicators = {}
+            raw_inds = data.get('indicators')
+            if raw_inds:
+                try:
+                    indicators = json.loads(raw_inds)
+                except:
+                    pass
+
+            return {
+                "ts": data.get('timestamp') or data.get('created_at', 'N/A'),
+                "action": data.get('action', 'HOLD'),
+                "balance": data.get('balance', 0),
+                "price": data.get('market_price', 0),
+                "logic": data.get('logic_applied', 'N/A'),
+                "conf": data.get('confidence', 0),
+                "inds": indicators
+            }
+        except Exception as e:
+            return f"🚨 Error de conexión: {str(e)}"
+
+    def update(self):
+        res = self.get_telemetry()
+        if isinstance(res, str):
+            return Panel(Text(res, style="bold red"), title="Status", border_style="red")
+
+        # --- HEADER ---
+        header = Panel(
+            Text(f"🛡️ G9-SENTINEL V25.6 | 🧠 TABLA: ai_decisions | 🕒 {datetime.now().strftime('%H:%M:%S')}", 
+                 justify="center", style="bold white on blue"), 
+            style="blue"
+        )
         
-        layout["account"].update(Panel(acc_table, title="[bold]Estado de Bóveda y Mando[/bold]", border_style="bright_blue"))
+        # --- STATS PANEL ---
+        stats = Table(show_header=False, box=box.SIMPLE, expand=True)
+        # Limpiar timestamp para que no sea tan largo
+        clean_ts = str(res['ts']).split('.')[0].replace('T', ' ')
+        stats.add_row("📅 Registro", clean_ts)
+        stats.add_row("🎯 Acción", f"[bold yellow]{res['action']}[/]")
+        stats.add_row("🧠 Confianza", f"{res['conf']}%")
+        stats.add_row("💰 Balance", f"{res['balance']:,} Sats")
+        stats.add_row("📊 Precio BTC", f"${res['price']:,}")
+        stats_p = Panel(stats, title="[cyan]Estado General[/]", border_style="cyan")
 
-        # --- 3. PANEL DE TELEMETRÍA MULTI-TEMPORALIDAD ---
-        tf_table = Table(expand=True)
-        tf_table.add_column("Timeframe", justify="center", style="bold white")
-        tf_table.add_column("Tendencia", justify="center")
-        tf_table.add_column("RSI (14)", justify="center")
-        tf_table.add_column("BB Alta", justify="center", style="cyan")
-        tf_table.add_column("BB Baja", justify="center", style="cyan")
+        # --- MARKET PANEL (RSI & TREND) ---
+        m_table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+        m_table.add_column("TF", justify="center")
+        m_table.add_column("RSI", justify="center")
+        m_table.add_column("Tendencia", justify="center")
+        m_table.add_column("Bandas BB", justify="center")
+        
+        for tf in ['m1', 'm5', 'h1', 'h4']:
+            tf_d = res['inds'].get(tf, {})
+            rsi = tf_d.get('rsi', 0)
+            # Color dinámico para RSI
+            rsi_s = "bold red" if rsi > 70 else ("bold green" if rsi < 30 else "white")
+            
+            # Formatear BB
+            bb_info = "N/A"
+            if 'bb_l' in tf_d and 'bb_u' in tf_d:
+                bb_info = f"{int(tf_d['bb_l'])} | {int(tf_d['bb_u'])}"
 
-        if data.get('indicators_snapshot'):
-            try:
-                market_data = json.loads(data['indicators_snapshot'])
-                
-                # Iteramos sobre los timeframes configurados en el engine
-                for tf in ['m1', 'm5', 'h1', 'h4']:
-                    if tf in market_data:
-                        info = market_data[tf]
-                        
-                        # Estilos para tendencia
-                        trend = info.get('trend', 'N/A')
-                        if trend == "UP":
-                            trend_styled = "[bold green]▲ UP[/bold green]"
-                        elif trend == "DOWN":
-                            trend_styled = "[bold red]▼ DOWN[/bold red]"
-                        else:
-                            trend_styled = trend
-                            
-                        # Estilos para RSI
-                        rsi = info.get('rsi', 'N/A')
-                        if isinstance(rsi, (int, float)):
-                            if rsi < 30:
-                                rsi_styled = f"[bold green]{rsi}[/bold green]" # Sobrevendido (Oportunidad)
-                            elif rsi > 70:
-                                rsi_styled = f"[bold red]{rsi}[/bold red]"   # Sobrecomprado (Peligro)
-                            else:
-                                rsi_styled = str(rsi)
-                        else:
-                            rsi_styled = str(rsi)
+            m_table.add_row(
+                tf.upper(), 
+                Text(str(rsi), style=rsi_s), 
+                Text(str(tf_d.get('trend', 'N/A')), style="green" if tf_d.get('trend') == "UP" else "red"),
+                bb_info
+            )
+        
+        market_p = Panel(m_table, title="[magenta]Telemetría Multi-Temporal[/]", border_style="magenta")
 
-                        tf_table.add_row(
-                            tf.upper(),
-                            trend_styled,
-                            rsi_styled,
-                            str(info.get('bb_u', 'N/A')),
-                            str(info.get('bb_l', 'N/A'))
-                        )
-            except Exception as e:
-                tf_table.add_row("ERROR", f"Fallo al parsear datos: {e}", "", "", "")
-        else:
-             tf_table.add_row("N/A", "Sin datos de mercado", "N/A", "N/A", "N/A")
+        # --- LAYOUT FINAL ---
+        layout = Layout()
+        layout.split_column(
+            Layout(name="h", size=3), 
+            Layout(name="m", ratio=1), 
+            Layout(name="f", size=6)
+        )
+        layout["m"].split_row(Layout(stats_p), Layout(market_p))
+        
+        # Footer con la lógica de Gemini
+        footer_text = Text(res['logic'], style="italic dim", justify="left")
+        layout["f"].update(Panel(footer_text, title="🧠 Razonamiento de la IA", border_style="green"))
+        layout["h"].update(header)
+        
+        return layout
 
-        layout["market"].update(Panel(tf_table, title="[bold]Radar de Mercado (Multi-Timeframe)[/bold]", border_style="green"))
-
-        # --- 4. PANEL DE LÓGICA / PENSAMIENTO ---
-        layout["footer"].update(Panel(Text(data.get('logic_applied', 'Sin registro de pensamiento.'), style="italic white"), title="[bold]Neural Feed (Pensamiento Crítico de Gemini)[/bold]", border_style="magenta"))
-    
-    else:
-        layout["account"].update(Panel("Sincronizando...", title="Estado de Bóveda"))
-        layout["market"].update(Panel("Esperando datos de temporalidad...", title="Radar de Mercado"))
-        layout["footer"].update(Panel("Esperando primera decisión de Gemini...", title="Neural Feed"))
-
-    return layout
-
-if __name__ == "__main__":
-    # Limpiamos la consola antes de iniciar para evitar parpadeos sucios
-    os.system('cls' if os.name == 'nt' else 'clear')
-    with Live(generate_ui(), refresh_per_second=1, screen=True) as live:
-        while True:
-            time.sleep(1)
-            live.update(generate_ui())
+# Ejecución
+dash = G9Dashboard(DB_PATH)
+with Live(dash.update(), refresh_per_second=1, screen=True) as live:
+    while True:
+        live.update(dash.update())
+        time.sleep(1)
