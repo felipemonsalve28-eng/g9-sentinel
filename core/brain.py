@@ -16,7 +16,8 @@ class G9Brain:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = self._get_conn()
         cursor = conn.cursor()
-        # Añadimos columna balance_sats si no existe
+        
+        # Sincronizamos la tabla con todas las columnas que el Engine necesita enviar
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,6 +27,7 @@ class G9Brain:
                 confidence INTEGER,
                 logic_applied TEXT,
                 pnl_sats INTEGER DEFAULT 0,
+                margin REAL DEFAULT 0,
                 balance_sats INTEGER DEFAULT 0,
                 indicators_snapshot TEXT
             )
@@ -34,12 +36,14 @@ class G9Brain:
         conn.close()
 
     def get_context_for_gemini(self, limit=10):
+        """Genera el bloque de texto que le da 'memoria' a Gemini sobre trades pasados."""
         try:
             conn = self._get_conn()
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            # Ahora pedimos también PnL y Margen para que la IA aprenda de sus errores
             cursor.execute('''
-                SELECT timestamp, market_price, action, pnl_sats, balance_sats
+                SELECT timestamp, market_price, action, pnl_sats, margin, balance_sats
                 FROM ai_decisions 
                 ORDER BY timestamp DESC LIMIT ?
             ''', (limit,))
@@ -51,22 +55,38 @@ class G9Brain:
 
             memory_block = "=== MEMORIA DE OPERACIONES RECIENTES ===\n"
             for row in rows:
-                memory_block += f"- {row['timestamp']} | {row['action']} | Bal: {row['balance_sats']} sats | PnL: {row['pnl_sats']}\n"
+                # Si el PnL es 0 y la acción fue SELL/CLOSE, la IA debe saberlo
+                pnl_str = f"{row['pnl_sats']} sats" if row['pnl_sats'] != 0 else "SIN CIERRE/0"
+                memory_block += (f"- {row['timestamp']} | {row['action']} | "
+                                 f"Margen: {row['margin']} | PnL: {pnl_str} | "
+                                 f"Bal: {row['balance_sats']}\n")
             return memory_block
         except Exception as e:
             return f"Error de memoria: {e}"
 
-    def save_decision(self, market_price, action, confidence, logic_applied, indicators=None, balance=0):
+    def save_decision(self, market_price, action, confidence, logic_applied, indicators=None, balance=0, pnl=0, margin=0):
+        """Guarda la decisión con el snapshot completo del estado de la cuenta."""
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
+            # INSERT con todos los campos nuevos
             cursor.execute('''
-                INSERT INTO ai_decisions (market_price, action, confidence, logic_applied, indicators_snapshot, balance_sats)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (market_price, action, confidence, logic_applied, json.dumps(indicators) if indicators else None, balance))
+                INSERT INTO ai_decisions 
+                (market_price, action, confidence, logic_applied, indicators_snapshot, balance_sats, pnl_sats, margin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                market_price, 
+                action, 
+                confidence, 
+                logic_applied, 
+                json.dumps(indicators) if indicators else None, 
+                balance, 
+                pnl, 
+                margin
+            ))
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            print(f"Error guardando memoria: {e}")
+            print(f"❌ Error guardando memoria: {e}")
             return False
