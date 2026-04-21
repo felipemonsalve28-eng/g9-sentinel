@@ -72,7 +72,7 @@ class G9SentinelEngine:
         }
 
     async def run_trading_cycle(self):
-        print(f"🚀 G9-SENTINEL V25.5: FULL DATA MODE ACTIVE")
+        print(f"🚀 G9-SENTINEL V25.5: FULL ASYNC MODE ACTIVE")
         async with LNMClient(self.config_lnm) as lnm:
             while True:
                 try:
@@ -86,7 +86,7 @@ class G9SentinelEngine:
                             "id": str(p.id),
                             "side": p.side,
                             "entry_price": float(p.price), 
-                            "pnl": float(p.pl),           
+                            "pnl": float(p.pl),            
                             "stoploss": float(p.stoploss) if p.stoploss else None,
                             "margin": int(p.margin),
                             "leverage": int(p.leverage)
@@ -98,33 +98,48 @@ class G9SentinelEngine:
                         "timestamp": datetime.now(timezone.utc).isoformat()
                     }
 
-                    ai_decision = None
+                    # 1. HILO DEL AUDITOR: Gestiona posiciones activas
                     if formatted_positions:
-                        ai_decision = await self.execute_ai_action("audit", account_snapshot, market_data, lnm)
-                        if ai_decision:
-                            await self.process_audit_decision(ai_decision, formatted_positions[0]['id'], lnm)
-                    else:
-                        ai_decision = await self.execute_ai_action("strategy", account_snapshot, market_data, lnm)
-                        if ai_decision:
-                            await self.process_strategy_decision(ai_decision, acc.balance, lnm)
+                        for pos in formatted_positions:
+                            # Pasamos solo la posición que se está evaluando para mayor precisión
+                            audit_snapshot = account_snapshot.copy()
+                            audit_snapshot["open_positions"] = [pos]
+                            
+                            audit_decision = await self.execute_ai_action("audit", audit_snapshot, market_data, lnm)
+                            if audit_decision:
+                                await self.process_audit_decision(audit_decision, pos['id'], lnm)
+                                
+                                # Guardar memoria del Auditor
+                                self.brain.save_decision(
+                                    market_price=market_data['m1']['price'],
+                                    action=audit_decision.get("action", "HOLD"),
+                                    confidence=audit_decision.get("confidence", 0),
+                                    logic_applied=audit_decision.get("logic", "N/A"),
+                                    indicators=market_data,
+                                    balance=acc.balance,
+                                    pnl=pos['pnl'],
+                                    margin=pos['margin']
+                                )
+                                print(f"🧠 Memoria G9 (Audit): Registro guardado (PnL: {pos['pnl']} sats).")
 
-                    # --- ESCRITURA EN DB (Ajustada a tu esquema real) ---
-                    if ai_decision:
-                        # Extraemos datos de la posición para la DB si existe
-                        current_pnl = formatted_positions[0]['pnl'] if formatted_positions else 0
-                        current_margin = formatted_positions[0]['margin'] if formatted_positions else 0
-                        
-                        self.brain.save_decision(
-                            market_price=market_data['m1']['price'],
-                            action=ai_decision.get("action", "HOLD"),
-                            confidence=ai_decision.get("confidence", 0),
-                            logic_applied=ai_decision.get("logic", "N/A"),
-                            indicators=market_data,
-                            balance=acc.balance,
-                            pnl=current_pnl,      # Para pnl_sats
-                            margin=current_margin  # Para margin
-                        )
-                        print(f"🧠 Memoria G9: Registro guardado en DB (PnL: {current_pnl} sats).")
+                    # 2. HILO DEL ESTRATEGA: Busca nuevas entradas (Máximo 3 simultáneas)
+                    if len(formatted_positions) < 3:
+                        strategy_decision = await self.execute_ai_action("strategy", account_snapshot, market_data, lnm)
+                        if strategy_decision and strategy_decision.get("action") in ["BUY", "SELL"]:
+                            await self.process_strategy_decision(strategy_decision, acc.balance, lnm)
+                            
+                            # Guardar memoria del Estratega
+                            self.brain.save_decision(
+                                market_price=market_data['m1']['price'],
+                                action=strategy_decision.get("action", "HOLD"),
+                                confidence=strategy_decision.get("confidence", 0),
+                                logic_applied=strategy_decision.get("logic", "N/A"),
+                                indicators=market_data,
+                                balance=acc.balance,
+                                pnl=0,
+                                margin=strategy_decision.get("margin", 0)
+                            )
+                            print(f"🧠 Memoria G9 (Strategy): Nueva entrada registrada en DB.")
 
                     await asyncio.sleep(60)
                 except Exception as e:
@@ -141,12 +156,12 @@ class G9SentinelEngine:
                 market=json.dumps(market, indent=2),
                 memoria=self.brain.get_context_for_gemini(limit=5)
             )
-            print(f"\n[DEBUG] PROMPT ENVIADO A GEMINI:\n{prompt}\n")
+            print(f"\n[DEBUG] EJECUTANDO PROMPT: {p_type.upper()}")
             resp = self.client_gemini.models.generate_content(model=self.model_name, contents=prompt)
             match = re.search(r'\{.*\}', resp.text, re.DOTALL)
             return json.loads(match.group(0)) if match else None
         except Exception as e:
-            print(f"🚨 Error IA: {e}")
+            print(f"🚨 Error IA ({p_type}): {e}")
             return None
 
     async def process_audit_decision(self, decision, pos_id, client):

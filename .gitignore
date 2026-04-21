@@ -6,3 +6,4 @@ data/*.db
 logs/*.log
 bot_output.log
 bot_context_report.txt
+*.log
